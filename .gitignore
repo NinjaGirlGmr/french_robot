@@ -1,0 +1,13 @@
+build/
+CMakeFiles/
+CMakeCache.txt
+*.elf
+*.uf2
+cmake-build-*/
+compile_commands.json
+*.swp
+*.log
+.DS_Store
+
+# Local network credentials
+wifi_config.h
