@@ -10,7 +10,7 @@ import pygame
 
 DEFAULT_CONFIG = Path("config.json")
 DEFAULT_PORT = 42424
-DEFAULT_RATE_HZ = 90.0
+DEFAULT_RATE_HZ = 180.0
 DEFAULT_DEADZONE = 0.08
 DEFAULT_TURN_SCALE = 0.5
 # Axis indices for Xbox controller (pygame/SDL typical):
@@ -18,7 +18,8 @@ DEFAULT_TURN_SCALE = 0.5
 #  axis 2 = right stick X (turn)  # some mappings use 3 for right stick Y
 DEFAULT_FORWARD_AXIS = 1
 DEFAULT_TURN_AXIS = 2
-DEFAULT_RESEND_INTERVAL = 0.3  # seconds; resend unchanged values to keep robot alive
+DEFAULT_RESEND_INTERVAL = 0.1  # seconds; resend unchanged values to keep robot alive
+DEFAULT_TOGGLE_BUTTON = 9  # left stick click on most Xbox controllers
 
 
 def clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -54,6 +55,12 @@ def parse_args(argv=None):
         type=int,
         default=DEFAULT_TURN_AXIS,
         help="Joystick axis index for turning (right stick X on most Xbox pads)",
+    )
+    parser.add_argument(
+        "--toggle-button",
+        type=int,
+        default=DEFAULT_TOGGLE_BUTTON,
+        help="Button index to toggle obstacle avoidance (left stick click on most Xbox pads)",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Unused placeholder for future config")
     return parser.parse_args(argv)
@@ -102,6 +109,10 @@ def send_stop(sock: socket.socket, addr: tuple[str, int]) -> None:
     sock.sendto(b"STOP", addr)
 
 
+def send_avoid_toggle(sock: socket.socket, addr: tuple[str, int]) -> None:
+    sock.sendto(b"AVOID TOGGLE", addr)
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -115,6 +126,7 @@ def main(argv=None):
     print(f"Sending DRIVE packets to {dest} at {args.rate} Hz. Ctrl+C to stop.")
     last_sent = (None, None)
     last_sent_time = 0.0
+    last_toggle_state = False
 
     try:
         while True:
@@ -125,6 +137,13 @@ def main(argv=None):
                     print("Controller disconnected; stopping motors.")
                     send_stop(sock, dest)
                     sys.exit(1)
+
+            # Toggle obstacle avoidance on button press (edge-triggered).
+            toggle_pressed = controller.get_button(args.toggle_button)
+            if toggle_pressed and not last_toggle_state:
+                send_avoid_toggle(sock, dest)
+                print("Toggled obstacle avoidance")
+            last_toggle_state = toggle_pressed
 
             left, right = axes_to_drive(
                 controller,

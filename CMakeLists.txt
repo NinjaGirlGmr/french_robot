@@ -36,6 +36,9 @@ pico_sdk_init()
 add_executable(french_robot
         french_robot.c
         motor.c
+        lidar.c
+        ultrasonic.c
+        ssd1306.c
         )
 
 pico_set_program_name(french_robot "french_robot")
@@ -49,6 +52,8 @@ pico_enable_stdio_usb(french_robot 1)
 target_link_libraries(french_robot
         pico_stdlib
         hardware_pwm
+        hardware_uart
+        hardware_i2c
         )
 
 # Add the standard include files to the build

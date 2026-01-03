@@ -11,7 +11,10 @@
 #include "pico/stdlib.h"
 
 #include "constants.h"
+#include "lidar.h"
 #include "motor.h"
+#include "ssd1306.h"
+#include "ultrasonic.h"
 #include "wifi_config.h"
 
 #ifndef WIFI_SSID
@@ -29,6 +32,8 @@ typedef struct {
 static volatile uint32_t last_command_ms = 0;
 static volatile bool has_drive_command = false;
 static drive_command_t last_drive = {0};
+static uint32_t last_display_ms = 0;
+static bool ultrasonic_block_active = false;
 
 static void log_drive_command(float left, float right) {
     // Derive forward/backward (Y) and turn (X) intents from motor values.
@@ -47,12 +52,112 @@ static void log_drive_command(float left, float right) {
     printf("CMD DRIVE left=%.3f right=%.3f %s %s\n", left, right, y_dir, x_dir);
 }
 
+static void render_status_display(void) {
+    char line[32];
+    int link = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    bool wifi_up = (link == CYW43_LINK_UP || link == CYW43_LINK_NOIP || link == CYW43_LINK_JOIN);
+
+    ssd1306_clear();
+
+    snprintf(line, sizeof(line), "SSID: %s", WIFI_SSID);
+    ssd1306_draw_text(0, 0, line);
+
+    const struct netif *netif = netif_default;
+    const ip4_addr_t *ip = NULL;
+    if (netif && netif_is_up(netif) && !ip4_addr_isany_val(*netif_ip4_addr(netif))) {
+        ip = netif_ip4_addr(netif);
+    }
+
+    if (wifi_up) {
+        if (ip) {
+            snprintf(line, sizeof(line), "IP: %s", ip4addr_ntoa(ip));
+        } else {
+            snprintf(line, sizeof(line), "IP: (DHCP)");
+        }
+    } else {
+        snprintf(line, sizeof(line), "IP: --");
+    }
+    ssd1306_draw_text(0, 1, line);
+
+    snprintf(line, sizeof(line), "WiFi: %s", wifi_up ? "UP" : "DOWN");
+    ssd1306_draw_text(0, 2, line);
+
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t last_us_ms = ultrasonic_last_measure_ms();
+    float us_cm = ultrasonic_last_distance_cm();
+    if (last_us_ms == 0 || (uint32_t)(now_ms - last_us_ms) > 500) {
+        snprintf(line, sizeof(line), "US: --");
+    } else if (us_cm < 0) {
+        snprintf(line, sizeof(line), "US: --");
+    } else {
+        snprintf(line, sizeof(line), "US: %.0f cm", us_cm);
+    }
+    ssd1306_draw_text(0, 3, line);
+
+    snprintf(line, sizeof(line), "Forward: %s", ultrasonic_block_active ? "Blocked" : "OK");
+    ssd1306_draw_text(0, 4, line);
+
+    ssd1306_flush();
+}
+
+static bool blocked_by_ultrasonic(float left, float right) {
+    // Only block forward motion; allow turns or reverse for escape.
+    const float forward = 0.5f * (left + right);
+    const float forward_deadzone = 0.05f;
+    if (forward <= forward_deadzone) {
+        return false;
+    }
+
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t last_us_ms = ultrasonic_last_measure_ms();
+    if (last_us_ms == 0 || (uint32_t)(now_ms - last_us_ms) > 400) {
+        ultrasonic_block_active = false;  // stale reading; release
+        return false;
+    }
+
+    float cm = ultrasonic_last_distance_cm();
+    if (cm < 0) {
+        ultrasonic_block_active = false;
+        return false;
+    }
+
+    const float clear_cm = ULTRASONIC_BLOCK_CM + 2.0f;  // small hysteresis to avoid flicker
+    if (cm <= ULTRASONIC_BLOCK_CM) {
+        if (!ultrasonic_block_active) {
+            printf("Ultrasonic block engaged: %.1f cm\n", cm);
+        }
+        ultrasonic_block_active = true;
+    } else if (cm > clear_cm) {
+        if (ultrasonic_block_active) {
+            printf("Ultrasonic block cleared: %.1f cm\n", cm);
+        }
+        ultrasonic_block_active = false;
+    }
+
+    if (ultrasonic_block_active) {
+        printf("Ultrasonic block: %.1f cm, ignoring forward command (%.3f)\n", cm, forward);
+    }
+    return ultrasonic_block_active;
+}
+
+static bool blocked_by_lidar(float left, float right) {
+    (void)left;
+    (void)right;
+    return false;  // Lidar-based blocking disabled
+}
+
 static void apply_drive(float left, float right) {
     // Clamp to safe range and drive both motors.
     if (left > 1.0f) left = 1.0f;
     if (left < -1.0f) left = -1.0f;
     if (right > 1.0f) right = 1.0f;
     if (right < -1.0f) right = -1.0f;
+
+    if (blocked_by_ultrasonic(left, right) || blocked_by_lidar(left, right)) {
+        motor_coast_all();
+        has_drive_command = false;
+        return;
+    }
 
     motor_drive(MOTOR_A, left);
     motor_drive(MOTOR_B, right);
@@ -195,6 +300,10 @@ int main() {
     motor_init();
     motor_coast_all();
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);  // Status LED on
+    ultrasonic_init();
+    ssd1306_init(OLED_I2C_INST, OLED_I2C_SDA_PIN, OLED_I2C_SCL_PIN, OLED_I2C_ADDR);
+    render_status_display();
+    last_display_ms = to_ms_since_boot(get_absolute_time());
 
     start_udp_listener();
 
@@ -205,6 +314,7 @@ int main() {
     while (true) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, !cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN));
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        ultrasonic_poll();
         uint32_t last_ms = last_command_ms;
         if (has_drive_command && (uint32_t)(now_ms - last_ms) > CONTROL_IDLE_TIMEOUT_MS) {
             motor_coast_all();
@@ -213,9 +323,18 @@ int main() {
         }
         // Throttle periodic logging to avoid USB/serial stalls.
         if ((uint32_t)(now_ms - last_log_ms) > 1000) {
-            printf("Heartbeat: %u ms uptime\n", now_ms);
+            float us_cm = ultrasonic_last_distance_cm();
+            if (us_cm < 0) {
+                printf("Heartbeat: %u ms uptime (ultrasonic: --)\n", now_ms);
+            } else {
+                printf("Heartbeat: %u ms uptime (ultrasonic: %.1f cm)\n", now_ms, us_cm);
+            }
             last_log_ms = now_ms;
         }
-        sleep_ms(10);
+        if ((uint32_t)(now_ms - last_display_ms) > 1000) {
+            render_status_display();
+            last_display_ms = now_ms;
+        }
+        sleep_ms(2);  // tightened loop delay to improve control responsiveness
     }
 }
